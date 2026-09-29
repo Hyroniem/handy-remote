@@ -383,6 +383,14 @@ async changeRemoteTranscriptionFallbackSetting(enabled: boolean) : Promise<Resul
     else return { status: "error", error: e  as any };
 }
 },
+async changeRemoteTranscriptionBusyTimeoutMsSetting(timeoutMs: number) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_remote_transcription_busy_timeout_ms_setting", { timeoutMs }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async changeLazyStreamCloseSetting(enabled: boolean) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("change_lazy_stream_close_setting", { enabled }) };
@@ -1057,7 +1065,14 @@ remote_transcription_api_key?: SecretString;
  * When the remote server fails, load the local model and transcribe
  * with it instead of losing the recording.
  */
-remote_transcription_fallback?: boolean }
+remote_transcription_fallback?: boolean; 
+/**
+ * With the fallback on: when the server accepts the connection but does
+ * not answer a short test request within this many milliseconds at the
+ * start of a recording (it is busy with a long file), transcribe locally.
+ * 0 turns the check off, leaving only the reachability test.
+ */
+remote_transcription_busy_timeout_ms?: number }
 export type AudioDevice = { index: string; name: string; is_default: boolean }
 export type AutoSubmitKey = "enter" | "ctrl_enter" | "cmd_enter"
 export type AvailableAccelerators = { transcribe: string[]; ort: string[]; gpu_devices: GpuDeviceOption[] }

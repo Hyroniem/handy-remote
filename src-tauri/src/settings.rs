@@ -559,6 +559,12 @@ pub struct AppSettings {
     /// with it instead of losing the recording.
     #[serde(default = "default_remote_transcription_fallback")]
     pub remote_transcription_fallback: bool,
+    /// With the fallback on: when the server accepts the connection but does
+    /// not answer a short test request within this many milliseconds at the
+    /// start of a recording (it is busy with a long file), transcribe locally.
+    /// 0 turns the check off, leaving only the reachability test.
+    #[serde(default = "default_remote_transcription_busy_timeout_ms")]
+    pub remote_transcription_busy_timeout_ms: u64,
 }
 
 fn default_remote_transcription_url() -> String {
@@ -567,6 +573,10 @@ fn default_remote_transcription_url() -> String {
 
 fn default_remote_transcription_fallback() -> bool {
     true
+}
+
+fn default_remote_transcription_busy_timeout_ms() -> u64 {
+    2000
 }
 
 fn default_model() -> String {
@@ -1027,6 +1037,7 @@ pub fn get_default_settings() -> AppSettings {
         remote_transcription_url: default_remote_transcription_url(),
         remote_transcription_api_key: SecretString::default(),
         remote_transcription_fallback: default_remote_transcription_fallback(),
+        remote_transcription_busy_timeout_ms: default_remote_transcription_busy_timeout_ms(),
     }
 }
 

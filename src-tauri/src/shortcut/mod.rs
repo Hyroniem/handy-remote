@@ -1323,6 +1323,18 @@ pub fn change_remote_transcription_fallback_setting(
 
 #[tauri::command]
 #[specta::specta]
+pub fn change_remote_transcription_busy_timeout_ms_setting(
+    app: AppHandle,
+    timeout_ms: u64,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.remote_transcription_busy_timeout_ms = timeout_ms;
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn change_lazy_stream_close_setting(app: AppHandle, enabled: bool) -> Result<(), String> {
     let mut settings = settings::get_settings(&app);
     settings.lazy_stream_close = enabled;

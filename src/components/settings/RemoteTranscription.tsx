@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { ToggleSwitch } from "../ui/ToggleSwitch";
 import { SettingContainer } from "../ui/SettingContainer";
 import { Input } from "../ui/Input";
+import { Slider } from "../ui/Slider";
 import { useSettings } from "../../hooks/useSettings";
 
 interface RemoteTranscriptionProps {
@@ -19,6 +20,8 @@ export const RemoteTranscription: React.FC<RemoteTranscriptionProps> =
     const url = getSetting("remote_transcription_url") ?? "";
     const apiKey = getSetting("remote_transcription_api_key") ?? "";
     const fallback = getSetting("remote_transcription_fallback") ?? true;
+    const busyTimeoutMs =
+      getSetting("remote_transcription_busy_timeout_ms") ?? 2000;
     const [localUrl, setLocalUrl] = useState(url);
     const [localApiKey, setLocalApiKey] = useState(apiKey);
 
@@ -104,6 +107,30 @@ export const RemoteTranscription: React.FC<RemoteTranscriptionProps> =
             description={t("settings.remoteTranscription.fallback.description")}
             descriptionMode={descriptionMode}
             grouped={grouped}
+          />
+        )}
+        {enabled && fallback && (
+          <Slider
+            value={busyTimeoutMs}
+            onChange={(value) =>
+              updateSetting("remote_transcription_busy_timeout_ms", value)
+            }
+            min={0}
+            max={10000}
+            step={500}
+            label={t("settings.remoteTranscription.busyTimeout.label")}
+            description={t(
+              "settings.remoteTranscription.busyTimeout.description",
+            )}
+            descriptionMode={descriptionMode}
+            grouped={grouped}
+            formatValue={(v) =>
+              v === 0
+                ? t("settings.remoteTranscription.busyTimeout.off")
+                : t("settings.remoteTranscription.busyTimeout.seconds", {
+                    seconds: v / 1000,
+                  })
+            }
           />
         )}
       </>

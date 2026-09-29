@@ -277,14 +277,29 @@ pub struct TranscriptionManager {
     /// `is_model_loaded()` consults this so the model still reports "loaded"
     /// while the worker holds it.
     active_engine_lease: Arc<AtomicU64>,
-    /// Last known reachability of the remote transcription server, refreshed
-    /// by a probe at the start of each recording and by every request.
+    /// Last known state of the remote transcription server, refreshed by a
+    /// probe at the start of each recording and by every request.
     remote_server_status: Arc<Mutex<Option<RemoteServerStatus>>>,
+    /// True while a probe runs, so recordings in quick succession don't pile
+    /// probes onto a server that is already busy, and so `transcribe()` can
+    /// wait for the answer of a probe that started with the recording.
+    remote_probe_in_flight: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteServerState {
+    /// Answered the probe in time.
+    Online,
+    /// Accepted the connection but did not answer in time, typically because
+    /// it is still transcribing a long file.
+    Busy,
+    /// Could not be reached at all.
+    Offline,
 }
 
 #[derive(Clone, Copy)]
 struct RemoteServerStatus {
-    online: bool,
+    state: RemoteServerState,
     checked_at: Instant,
 }
 
@@ -307,6 +322,7 @@ impl TranscriptionManager {
             active_stream_worker: Arc::new(AtomicU64::new(0)),
             active_engine_lease: Arc::new(AtomicU64::new(0)),
             remote_server_status: Arc::new(Mutex::new(None)),
+            remote_probe_in_flight: Arc::new(AtomicBool::new(false)),
         };
 
         // Start the idle watcher
@@ -760,46 +776,81 @@ impl TranscriptionManager {
     }
 
     /// Check in the background, while the user is still speaking, whether the
-    /// remote server accepts connections. If it doesn't and the fallback is
-    /// on, the local model starts loading right away, so the recording can be
-    /// transcribed locally without first waiting for the request to fail.
+    /// remote server can take the recording. If it is unreachable, or busy
+    /// enough that it doesn't answer within the busy timeout, and the
+    /// fallback is on, the local model starts loading right away, so the
+    /// recording can be transcribed locally without waiting for the server.
     fn probe_remote_server(&self) {
+        if self.remote_probe_in_flight.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let manager = self.clone();
         thread::spawn(move || {
             let settings = get_settings(&manager.app_handle);
-            let online = remote_server_reachable(&settings.remote_transcription_url);
-            manager.set_remote_server_online(online);
-            if online {
-                debug!("Transcription server is reachable");
-            } else if settings.remote_transcription_fallback && !settings.selected_model.is_empty()
-            {
-                info!(
-                    "Transcription server at {} is unreachable; preloading local model '{}'",
-                    settings.remote_transcription_url, settings.selected_model
-                );
-                manager.initiate_local_model_load();
-            } else {
-                info!(
-                    "Transcription server at {} is unreachable",
-                    settings.remote_transcription_url
-                );
+            let can_fall_back =
+                settings.remote_transcription_fallback && !settings.selected_model.is_empty();
+            let busy_timeout = remote_busy_timeout(&settings);
+            let state = match busy_timeout {
+                Some(timeout) if can_fall_back => probe_remote_responsiveness(&settings, timeout),
+                _ if remote_server_reachable(&settings.remote_transcription_url) => {
+                    RemoteServerState::Online
+                }
+                _ => RemoteServerState::Offline,
+            };
+            // Record the state before clearing the flag: transcribe() reads it
+            // as soon as the flag drops.
+            manager.set_remote_server_state(state);
+            manager
+                .remote_probe_in_flight
+                .store(false, Ordering::Release);
+
+            let url = &settings.remote_transcription_url;
+            match state {
+                RemoteServerState::Online => debug!("Transcription server is responsive"),
+                _ if !can_fall_back => info!("Transcription server at {} is {:?}", url, state),
+                RemoteServerState::Busy => {
+                    info!(
+                        "Transcription server at {} did not answer within {}ms; preloading local model '{}'",
+                        url,
+                        settings.remote_transcription_busy_timeout_ms,
+                        settings.selected_model
+                    );
+                    manager.initiate_local_model_load();
+                }
+                RemoteServerState::Offline => {
+                    info!(
+                        "Transcription server at {} is unreachable; preloading local model '{}'",
+                        url, settings.selected_model
+                    );
+                    manager.initiate_local_model_load();
+                }
             }
         });
     }
 
-    fn set_remote_server_online(&self, online: bool) {
+    fn set_remote_server_state(&self, state: RemoteServerState) {
         *self.remote_server_status.lock().unwrap() = Some(RemoteServerStatus {
-            online,
+            state,
             checked_at: Instant::now(),
         });
     }
 
-    /// True when a recent probe or request found the server unreachable.
-    fn remote_server_known_offline(&self) -> bool {
+    /// The state a recent probe or request found, if it is still current.
+    fn recent_remote_server_state(&self) -> Option<RemoteServerState> {
         self.remote_server_status
             .lock()
             .unwrap()
-            .is_some_and(|s| !s.online && s.checked_at.elapsed() < REMOTE_STATUS_MAX_AGE)
+            .filter(|s| s.checked_at.elapsed() < REMOTE_STATUS_MAX_AGE)
+            .map(|s| s.state)
+    }
+
+    /// A recording shorter than the busy timeout ends before its probe has
+    /// an answer; wait for it rather than sending to a server that may be busy.
+    fn wait_for_remote_probe(&self, busy_timeout: Duration) {
+        let deadline = Instant::now() + busy_timeout + REMOTE_PROBE_TIMEOUT + REMOTE_PROBE_SLACK;
+        while self.remote_probe_in_flight.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Like [`Self::initiate_model_load`], but also while a remote server is
@@ -1264,16 +1315,31 @@ impl TranscriptionManager {
         if settings.remote_transcription_enabled {
             let can_fall_back =
                 settings.remote_transcription_fallback && !settings.selected_model.is_empty();
-            // The probe at recording start already found the server down:
-            // don't spend the connect timeout finding that out again.
-            let result = if can_fall_back && self.remote_server_known_offline() {
-                Err(anyhow::anyhow!("server unreachable at recording start"))
+            if can_fall_back {
+                if let Some(busy_timeout) = remote_busy_timeout(&settings) {
+                    self.wait_for_remote_probe(busy_timeout);
+                }
+            }
+            // The probe at recording start already found the server down or
+            // busy: don't wait for it again, the local model is loading.
+            let known_state = if can_fall_back {
+                self.recent_remote_server_state()
             } else {
-                transcribe_remote(&audio, &settings)
+                None
+            };
+            let result = match known_state {
+                Some(RemoteServerState::Offline) => {
+                    Err(anyhow::anyhow!("server unreachable at recording start"))
+                }
+                Some(RemoteServerState::Busy) => Err(anyhow::anyhow!(
+                    "server busy: no answer within {}ms at recording start",
+                    settings.remote_transcription_busy_timeout_ms
+                )),
+                _ => transcribe_remote(&audio, &settings),
             };
             match result {
                 Ok(text) => {
-                    self.set_remote_server_online(true);
+                    self.set_remote_server_state(RemoteServerState::Online);
                     // The server is back: free the model the fallback loaded,
                     // unless it is still loading for a concurrent request.
                     if self.is_model_loaded() && !*self.is_loading.lock().unwrap() {
@@ -1286,7 +1352,7 @@ impl TranscriptionManager {
                 }
                 Err(e) => {
                     if e.is::<RemoteUnreachable>() {
-                        self.set_remote_server_online(false);
+                        self.set_remote_server_state(RemoteServerState::Offline);
                     }
                     if !settings.remote_transcription_fallback {
                         return Err(e);
@@ -1652,6 +1718,18 @@ const REMOTE_TRANSCRIPTION_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
 /// How long a probe result counts as current. Recordings are rarely longer.
 const REMOTE_STATUS_MAX_AGE: Duration = Duration::from_secs(120);
+/// Extra time `transcribe()` gives a running probe beyond its own timeouts,
+/// for DNS lookup and thread scheduling.
+const REMOTE_PROBE_SLACK: Duration = Duration::from_millis(500);
+/// Length of the silent clip the responsiveness probe sends. Long enough for
+/// servers that reject very short audio, short enough to cost nothing.
+const REMOTE_PROBE_AUDIO_SAMPLES: usize = 8_000;
+
+/// The busy timeout from the settings, or `None` when busy detection is off.
+fn remote_busy_timeout(settings: &AppSettings) -> Option<Duration> {
+    (settings.remote_transcription_busy_timeout_ms > 0)
+        .then(|| Duration::from_millis(settings.remote_transcription_busy_timeout_ms))
+}
 
 /// The request never reached the server (as opposed to the server answering
 /// with an error), so the server counts as offline.
@@ -1714,64 +1792,25 @@ fn transcribe_remote(audio: &[f32], settings: &AppSettings) -> Result<String> {
     let api_key = settings.remote_transcription_api_key.trim().to_string();
     let wav = encode_wav(audio)?;
 
-    // reqwest is async and transcribe() is called both from async tasks and
-    // from plain threads; blocking on the runtime from inside one of its own
-    // tasks panics, so the request runs on a thread of its own.
-    let request_url = url.clone();
-    let text = thread::spawn(move || {
-        tauri::async_runtime::block_on(async move {
-            let mut form = reqwest::multipart::Form::new()
-                .part(
-                    "file",
-                    reqwest::multipart::Part::bytes(wav)
-                        .file_name("audio.wav")
-                        .mime_str("audio/wav")?,
-                )
-                .text("model", "whisper-1")
-                .text("response_format", "json");
-            if send_language {
-                form = form.text("language", language);
-            }
-            if !prompt.is_empty() {
-                form = form.text("prompt", prompt);
-            }
-
-            let mut request = reqwest::Client::builder()
-                .timeout(REMOTE_TRANSCRIPTION_TIMEOUT)
-                .connect_timeout(REMOTE_TRANSCRIPTION_CONNECT_TIMEOUT)
-                .build()?
-                .post(&request_url)
-                .multipart(form);
-            if !api_key.is_empty() {
-                request = request.bearer_auth(&api_key);
-            }
-            let response = request.send().await.map_err(|e| {
-                let message = format!(
-                    "Could not reach transcription server at {}: {}",
-                    request_url, e
-                );
-                if e.is_connect() {
-                    anyhow::Error::new(RemoteUnreachable(message))
-                } else {
-                    anyhow::anyhow!(message)
-                }
-            })?;
-            let status = response.status();
-            let body = response.text().await?;
-            if !status.is_success() {
-                return Err(anyhow::anyhow!(
-                    "Transcription server returned {}: {}",
-                    status,
-                    body.trim()
-                ));
-            }
-            let parsed: RemoteTranscriptionResponse = serde_json::from_str(&body)
-                .map_err(|e| anyhow::anyhow!("Unexpected response from server: {}", e))?;
-            Ok::<String, anyhow::Error>(parsed.text)
-        })
-    })
-    .join()
-    .map_err(|_| anyhow::anyhow!("Remote transcription thread panicked"))??;
+    let (status, body) = send_remote_request(RemoteRequest {
+        url: url.clone(),
+        wav,
+        language: send_language.then_some(language),
+        prompt,
+        api_key,
+        timeout: REMOTE_TRANSCRIPTION_TIMEOUT,
+        connect_timeout: REMOTE_TRANSCRIPTION_CONNECT_TIMEOUT,
+    })?;
+    if !status.is_success() {
+        return Err(anyhow::anyhow!(
+            "Transcription server returned {}: {}",
+            status,
+            body.trim()
+        ));
+    }
+    let text = serde_json::from_str::<RemoteTranscriptionResponse>(&body)
+        .map_err(|e| anyhow::anyhow!("Unexpected response from server: {}", e))?
+        .text;
 
     let output_language = if settings.translate_to_english {
         OutputLanguageEvidence::TranslatedToEnglish
@@ -1798,6 +1837,121 @@ fn transcribe_remote(audio: &[f32], settings: &AppSettings) -> Result<String> {
         );
     }
     Ok(result)
+}
+
+/// The request timed out before the server answered: it accepted the
+/// connection, so it is up, but it is busy.
+#[derive(Debug)]
+struct RemoteTimedOut(String);
+
+impl std::fmt::Display for RemoteTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RemoteTimedOut {}
+
+struct RemoteRequest {
+    url: String,
+    wav: Vec<u8>,
+    language: Option<String>,
+    prompt: String,
+    api_key: String,
+    timeout: Duration,
+    connect_timeout: Duration,
+}
+
+/// POST a WAV file to an OpenAI-compatible audio endpoint and return the
+/// status and body of the answer. Transport failures come back as
+/// [`RemoteUnreachable`] or [`RemoteTimedOut`] where they can be told apart.
+fn send_remote_request(req: RemoteRequest) -> Result<(reqwest::StatusCode, String)> {
+    // reqwest is async and transcribe() is called both from async tasks and
+    // from plain threads; blocking on the runtime from inside one of its own
+    // tasks panics, so the request runs on a thread of its own.
+    thread::spawn(move || {
+        tauri::async_runtime::block_on(async move {
+            let mut form = reqwest::multipart::Form::new()
+                .part(
+                    "file",
+                    reqwest::multipart::Part::bytes(req.wav)
+                        .file_name("audio.wav")
+                        .mime_str("audio/wav")?,
+                )
+                .text("model", "whisper-1")
+                .text("response_format", "json");
+            if let Some(language) = req.language {
+                form = form.text("language", language);
+            }
+            if !req.prompt.is_empty() {
+                form = form.text("prompt", req.prompt);
+            }
+
+            let mut request = reqwest::Client::builder()
+                .timeout(req.timeout)
+                .connect_timeout(req.connect_timeout)
+                .build()?
+                .post(&req.url)
+                .multipart(form);
+            if !req.api_key.is_empty() {
+                request = request.bearer_auth(&req.api_key);
+            }
+            let url = req.url;
+            let classify = move |e: reqwest::Error| {
+                let message = format!("Could not reach transcription server at {}: {}", url, e);
+                if e.is_connect() {
+                    anyhow::Error::new(RemoteUnreachable(message))
+                } else if e.is_timeout() {
+                    anyhow::Error::new(RemoteTimedOut(message))
+                } else {
+                    anyhow::anyhow!(message)
+                }
+            };
+            let response = request.send().await.map_err(&classify)?;
+            let status = response.status();
+            let body = response.text().await.map_err(&classify)?;
+            Ok((status, body))
+        })
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("Remote transcription thread panicked"))?
+}
+
+/// Send a short silent clip and see whether the server answers within
+/// `busy_timeout`. A plain connection test is not enough: a server that is
+/// transcribing a long file still accepts connections, but a new request
+/// waits until it is done. Any HTTP answer, even an error, counts as online.
+fn probe_remote_responsiveness(
+    settings: &AppSettings,
+    busy_timeout: Duration,
+) -> RemoteServerState {
+    let base_url = settings
+        .remote_transcription_url
+        .trim()
+        .trim_end_matches('/');
+    if base_url.is_empty() {
+        return RemoteServerState::Offline;
+    }
+    let Ok(wav) = encode_wav(&[0.0; REMOTE_PROBE_AUDIO_SAMPLES]) else {
+        return RemoteServerState::Offline;
+    };
+    let result = send_remote_request(RemoteRequest {
+        url: format!("{}/audio/transcriptions", base_url),
+        wav,
+        language: None,
+        prompt: String::new(),
+        api_key: settings.remote_transcription_api_key.trim().to_string(),
+        timeout: busy_timeout,
+        connect_timeout: REMOTE_PROBE_TIMEOUT.min(busy_timeout),
+    });
+    match result {
+        Ok(_) => RemoteServerState::Online,
+        Err(e) if e.is::<RemoteTimedOut>() => RemoteServerState::Busy,
+        Err(e) => {
+            debug!("Transcription server probe failed: {}", e);
+            RemoteServerState::Offline
+        }
+    }
 }
 
 /// 16 kHz mono 16-bit PCM WAV in memory, the same format Handy saves recordings in.

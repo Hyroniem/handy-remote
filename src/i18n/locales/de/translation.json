@@ -657,6 +657,12 @@
       "fallback": {
         "label": "Fall Back to Local Model",
         "description": "If the server can't be reached or returns an error, transcribe with the local model. Handy checks the server as soon as recording starts, so the local model can already load while you speak. Once the server answers again, the local model is unloaded."
+      },
+      "busyTimeout": {
+        "label": "Switch When Server Is Busy",
+        "description": "When the server accepts the connection but doesn't answer a short test request within this time, for example because it is still transcribing a long recording, Handy uses the local model. Once the server answers quickly again, it switches back. Off only checks whether the server can be reached.",
+        "off": "Off",
+        "seconds": "{{seconds}} s"
       }
     }
   },

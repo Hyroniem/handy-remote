@@ -170,6 +170,8 @@ const settingUpdaters: {
     commands.changeRemoteTranscriptionApiKeySetting(value as string),
   remote_transcription_fallback: (value) =>
     commands.changeRemoteTranscriptionFallbackSetting(value as boolean),
+  remote_transcription_busy_timeout_ms: (value) =>
+    commands.changeRemoteTranscriptionBusyTimeoutMsSetting(value as number),
   log_level: (value) => commands.setLogLevel(value as any),
   app_language: (value) => commands.changeAppLanguageSetting(value as string),
   theme: (value) => commands.changeThemeSetting(value as string),
