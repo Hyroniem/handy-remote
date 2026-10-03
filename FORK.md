@@ -24,7 +24,19 @@ in Terminal: `xattr -dr com.apple.quarantine /Applications/Handy.app`. Omdat elk
 build een eigen handtekening heeft, moet je na een update de toegang tot
 Toegankelijkheid en Microfoon mogelijk opnieuw geven.
 
-## Een upstream-update binnenhalen
+## Automatisch bijhouden van upstream
+
+De workflow **Upstream Sync** kijkt elke dag (en op verzoek via _Actions → Upstream Sync → Run workflow_) of cjpais/Handy een nieuwe release `vX.Y.Z` heeft. Zo ja:
+
+1. Hij merget die release in een branch `upstream-sync/vX.Y.Z` en opent een pull request naar `main`.
+2. Hij start **Fork Build** op die branch, zodat je ziet of alles compileert.
+3. Is de build groen, dan merge je de pull request. Daarna bouwt **Fork Build** op `main` de installers.
+
+Er wordt niets vanzelf in `main` gezet: een schone merge kan toch niet bouwen als upstream code verwijdert die de externe-serveroptie gebruikt. Bij een merge-conflict opent de workflow een issue.
+
+Optioneel: een secret `SYNC_TOKEN` (PAT met rechten `repo` en `workflow`) laat ook de checks `test` en `code quality` op de pull request draaien, en is nodig als upstream iets onder `.github/workflows` wijzigt.
+
+## Een upstream-update handmatig binnenhalen
 
 1. Open https://github.com/Hyroniem/handy-remote. Staat er "This branch is N commits behind
    cjpais/Handy:main", klik dan op **Sync fork → Update branch**.

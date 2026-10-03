@@ -1,0 +1,161 @@
+name: "Upstream Sync"
+
+# Looks daily for a new upstream release tag (vX.Y.Z on cjpais/Handy). When
+# there is one, merges that tag into a branch upstream-sync/<tag>, opens a pull
+# request to main and starts Fork Build on the branch so the result is
+# compiled before anything lands on main. Nothing is merged into main
+# automatically; merging the pull request starts the normal Fork Build on main.
+#
+# A merge conflict opens an issue instead. Needs no secrets. Set the
+# SYNC_TOKEN secret (a PAT with repo and workflow scope) to also start the
+# test and code quality checks on the pull request and to allow upstream
+# changes under .github/workflows, which the default token cannot push.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to merge (default: latest vX.Y.Z)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: upstream-sync
+
+env:
+  UPSTREAM_URL: https://github.com/cjpais/Handy.git
+
+jobs:
+  sync:
+    # Never run in upstream itself.
+    if: github.repository != 'cjpais/Handy'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Find the upstream release
+        id: find
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream --tags --no-recurse-submodules
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)
+          fi
+          if [ -z "$tag" ] || ! git rev-parse -q --verify "refs/tags/$tag^{commit}" >/dev/null; then
+            echo "No upstream tag found (${tag:-none})."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git merge-base --is-ancestor "refs/tags/$tag^{commit}" HEAD; then
+            echo "$tag is already in main."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "branch=upstream-sync/$tag" >> "$GITHUB_OUTPUT"
+          echo "needed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if a pull request or issue already exists
+        id: existing
+        if: steps.find.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+          TAG: ${{ steps.find.outputs.tag }}
+          BRANCH: ${{ steps.find.outputs.branch }}
+        run: |
+          # --state all: a closed or squash-merged pull request must not
+          # make the next run open the same one again.
+          prs=$(gh pr list --head "$BRANCH" --state all --json number --jq length)
+          issues=$(gh issue list --state all --search "\"Upstream $TAG\" in:title" --json number --jq length)
+          if [ "$prs" != "0" ] || [ "$issues" != "0" ]; then
+            echo "$TAG was already handled (pull requests: $prs, issues: $issues)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge the tag
+        id: merge
+        if: steps.find.outputs.needed == 'true' && steps.existing.outputs.skip == 'false'
+        env:
+          TAG: ${{ steps.find.outputs.tag }}
+          BRANCH: ${{ steps.find.outputs.branch }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          if git merge --no-ff -m "chore: merge upstream Handy $TAG into fork" "refs/tags/$TAG^{commit}"; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
+            git merge --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push the branch and open a pull request
+        id: pr
+        if: steps.merge.outputs.conflict == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+          TAG: ${{ steps.find.outputs.tag }}
+          BRANCH: ${{ steps.find.outputs.branch }}
+        run: |
+          if ! git push origin "$BRANCH"; then
+            # Typically upstream changed .github/workflows and the token
+            # has no workflow scope.
+            gh issue create \
+              --title "Upstream $TAG could not be pushed" \
+              --body "The merge of upstream $TAG is clean, but pushing branch \`$BRANCH\` failed. If upstream changed files under \`.github/workflows\`, add a \`SYNC_TOKEN\` secret (PAT with repo and workflow scope), then run **Upstream Sync** again with tag \`$TAG\`. Otherwise merge it by hand: see FORK.md."
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/body.md" <<EOF
+          Automatic merge of upstream Handy $TAG (https://github.com/cjpais/Handy/releases/tag/$TAG).
+
+          The merge had no textual conflicts, but that does not prove the fork still compiles: upstream can remove or change code that the remote transcription option uses. **Fork Build** was started on this branch. Merge only when it is green, then test dictation with the external server.
+
+          Merging into main starts Fork Build there, which produces the installers.
+
+          Generated by the Upstream Sync workflow.
+          EOF
+          gh pr create --base main --head "$BRANCH" \
+            --title "chore: merge upstream Handy $TAG" \
+            --body-file "$RUNNER_TEMP/body.md"
+          # workflow_dispatch is exempt from the rule that events caused by
+          # the default token start no workflows.
+          gh workflow run fork-build.yml --ref "$BRANCH"
+
+      - name: Open an issue about the conflict
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+          TAG: ${{ steps.find.outputs.tag }}
+        run: |
+          {
+            echo "Merging upstream $TAG into main gives conflicts in:"
+            echo
+            sed 's/^/- `/; s/$/`/' "$RUNNER_TEMP/conflicts.txt"
+            echo
+            echo "Resolve them locally (never use 'Discard commits' in Sync fork, that removes the external server option; see FORK.md), or start a Claude Code session on this repo and ask it to merge upstream $TAG."
+            echo
+            echo "Generated by the Upstream Sync workflow."
+          } > "$RUNNER_TEMP/issue.md"
+          gh issue create --title "Upstream $TAG has merge conflicts" \
+            --body-file "$RUNNER_TEMP/issue.md"
