@@ -1791,7 +1791,7 @@ fn transcribe_remote(audio: &[f32], settings: &AppSettings) -> Result<String> {
     };
     let url = format!("{}/audio/{}", base_url, endpoint);
 
-    let language = normalize_cjk_language(&settings.selected_language).to_string();
+    let language = settings.selected_language.clone();
     let send_language = !settings.translate_to_english && language != "auto";
     // Whisper servers take custom words as the initial prompt, the same way
     // the local whisper path does.
