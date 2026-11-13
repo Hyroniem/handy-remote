@@ -922,7 +922,7 @@
       },
       "busyTimeout": {
         "label": "Overschakelen als de server bezet is",
-        "description": "Accepteert de server de verbinding, maar beantwoordt hij een kort testverzoek niet binnen deze tijd, bijvoorbeeld omdat hij nog een lange opname uitwerkt, dan gebruikt Handy het lokale model. Hetzelfde gebeurt als een opname langer duurt dan deze tijd plus een kwart van de opnameduur; de server wordt dan 30 seconden overgeslagen. Zodra de server weer snel reageert, schakelt Handy terug. Uit controleert alleen of de server bereikbaar is.",
+        "description": "Accepteert de server de verbinding, maar beantwoordt hij een kort testverzoek niet binnen deze tijd, bijvoorbeeld omdat hij nog een lange opname uitwerkt, dan gebruikt Handy het lokale model. Hetzelfde gebeurt als een opname langer duurt dan deze tijd plus de opnameduur (minstens 10 seconden); de server wordt dan 30 seconden overgeslagen. Zodra de server weer snel reageert, schakelt Handy terug. Uit controleert alleen of de server bereikbaar is.",
         "off": "Uit",
         "seconds": "{{seconds}} s"
       }

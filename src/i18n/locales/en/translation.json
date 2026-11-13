@@ -922,7 +922,7 @@
       },
       "busyTimeout": {
         "label": "Switch When Server Is Busy",
-        "description": "When the server accepts the connection but doesn't answer a short test request within this time, for example because it is still transcribing a long recording, Handy uses the local model. The same applies when a recording takes longer than this time plus a quarter of its length; the server is then skipped for 30 seconds. Once the server answers quickly again, it switches back. Off only checks whether the server can be reached.",
+        "description": "When the server accepts the connection but doesn't answer a short test request within this time, for example because it is still transcribing a long recording, Handy uses the local model. The same applies when a recording takes longer than this time plus its own length (at least 10 seconds); the server is then skipped for 30 seconds. Once the server answers quickly again, it switches back. Off only checks whether the server can be reached.",
         "off": "Off",
         "seconds": "{{seconds}} s"
       }
