@@ -817,8 +817,8 @@ impl TranscriptionManager {
 
     /// Send the recording to the server. With the fallback and busy detection
     /// on, the server gets a deadline that grows with the recording, and the
-    /// local model starts loading once the busy timeout passes without an
-    /// answer, so a slow server costs little more than the deadline.
+    /// local model starts loading halfway to that deadline, so a server that
+    /// is really busy costs little more than the deadline.
     fn transcribe_remote_with_deadline(
         &self,
         audio: &[f32],
@@ -829,6 +829,7 @@ impl TranscriptionManager {
             return transcribe_remote(audio, settings, REMOTE_TRANSCRIPTION_TIMEOUT);
         };
         let deadline = remote_answer_deadline(busy_timeout, audio.len());
+        let preload_after = remote_preload_after(busy_timeout, deadline);
 
         let answered = Arc::new(AtomicBool::new(false));
         {
@@ -836,11 +837,11 @@ impl TranscriptionManager {
             let manager = self.clone();
             let model = settings.selected_model.clone();
             thread::spawn(move || {
-                thread::sleep(busy_timeout);
+                thread::sleep(preload_after);
                 if !answered.load(Ordering::Acquire) {
                     info!(
                         "Transcription server has not answered after {}ms; preloading local model '{}'",
-                        busy_timeout.as_millis(),
+                        preload_after.as_millis(),
                         model
                     );
                     manager.initiate_local_model_load(false);
@@ -1676,18 +1677,34 @@ const REMOTE_PROBE_SLACK: Duration = Duration::from_millis(500);
 /// servers that reject very short audio, short enough to cost nothing.
 const REMOTE_PROBE_AUDIO_SAMPLES: usize = 8_000;
 
-/// Server time allowed per second of audio when a fallback is ready. A Whisper
-/// server on a GPU that is free needs a small fraction of this.
-const REMOTE_SECONDS_PER_AUDIO_SECOND: f64 = 0.25;
+/// Server time allowed per second of audio when a fallback is ready: real
+/// time. A Whisper server on a GPU that is free needs a small fraction of
+/// this, but beam search, a long prompt or a decode that loops on silence
+/// can take several times its usual time without the server being busy.
+const REMOTE_SECONDS_PER_AUDIO_SECOND: f64 = 1.0;
+/// The shortest deadline a recording gets, however short it is. Below this,
+/// one slow decode already sends the recording to the local model, which
+/// then has to load first and is slower than waiting.
+const REMOTE_MIN_ANSWER_DEADLINE: Duration = Duration::from_secs(10);
 /// How long the server is skipped after a request ran past its deadline.
 const REMOTE_BUSY_HOLD: Duration = Duration::from_secs(30);
 
 /// How long a recording of `samples` (16 kHz) may take on the server before
-/// the local model takes over: the busy timeout plus a share of its length.
+/// the local model takes over: the busy timeout plus its length, and never
+/// less than [`REMOTE_MIN_ANSWER_DEADLINE`].
 fn remote_answer_deadline(busy_timeout: Duration, samples: usize) -> Duration {
     let audio_secs = samples as f64 / 16_000.0;
     (busy_timeout + Duration::from_secs_f64(audio_secs * REMOTE_SECONDS_PER_AUDIO_SECOND))
+        .max(REMOTE_MIN_ANSWER_DEADLINE)
         .min(REMOTE_TRANSCRIPTION_TIMEOUT)
+}
+
+/// When to start loading the local model while a request is still running:
+/// halfway to the deadline. Loading it sooner, while a server on the same
+/// machine is still decoding, takes the GPU and memory that server needs and
+/// makes it miss the deadline it would otherwise have met.
+fn remote_preload_after(busy_timeout: Duration, deadline: Duration) -> Duration {
+    (deadline / 2).max(busy_timeout)
 }
 
 /// The busy timeout from the settings, or `None` when busy detection is off.
@@ -2510,16 +2527,35 @@ mod tests {
     #[test]
     fn remote_deadline_grows_with_the_recording() {
         let busy = Duration::from_secs(2);
-        // 10 s of audio: 2 s + 10 s * 0.25.
+        // 20 s of audio: 2 s + 20 s.
         assert_eq!(
-            remote_answer_deadline(busy, 160_000),
-            Duration::from_millis(4_500)
+            remote_answer_deadline(busy, 320_000),
+            Duration::from_secs(22)
         );
-        assert_eq!(remote_answer_deadline(busy, 0), busy);
+        // A short recording still gets the minimum.
+        assert_eq!(remote_answer_deadline(busy, 0), REMOTE_MIN_ANSWER_DEADLINE);
+        assert_eq!(
+            remote_answer_deadline(busy, 16_000 * 5),
+            REMOTE_MIN_ANSWER_DEADLINE
+        );
         // Never longer than without a fallback.
         assert_eq!(
             remote_answer_deadline(busy, 16_000 * 3_600),
             REMOTE_TRANSCRIPTION_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn local_model_preloads_halfway_to_the_deadline() {
+        let busy = Duration::from_secs(2);
+        assert_eq!(
+            remote_preload_after(busy, Duration::from_secs(10)),
+            Duration::from_secs(5)
+        );
+        // Never before the busy timeout.
+        assert_eq!(
+            remote_preload_after(Duration::from_secs(8), Duration::from_secs(10)),
+            Duration::from_secs(8)
         );
     }
 
