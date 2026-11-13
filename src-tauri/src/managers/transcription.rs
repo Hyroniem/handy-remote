@@ -281,15 +281,10 @@ pub struct TranscriptionManager {
     /// Last known state of the remote transcription server, refreshed by a
     /// probe at the start of each recording and by every request.
     remote_server_status: Arc<Mutex<Option<RemoteServerStatus>>>,
-    /// True while a probe request runs, so recordings in quick succession
-    /// don't pile probes onto a server that is already busy. A probe that
-    /// passes the busy timeout keeps running, so a server that was only
-    /// loading its model can still take the recording once it answers.
+    /// True while a probe runs, so recordings in quick succession don't pile
+    /// probes onto a server that is already busy, and so `transcribe()` can
+    /// wait for the answer of a probe that started with the recording.
     remote_probe_in_flight: Arc<AtomicBool>,
-    /// True until the probe has answered or the busy timeout has passed, so
-    /// `transcribe()` can wait for the verdict of a probe that started with
-    /// the recording.
-    remote_probe_verdict_pending: Arc<AtomicBool>,
     /// Until when the server counts as busy because a real request ran past
     /// its deadline. The silent probe can't overrule this: a server that
     /// skips silence answers it at once even while its GPU is saturated.
@@ -334,7 +329,6 @@ impl TranscriptionManager {
             language_detector: Arc::new(LanguageDetector::default()),
             remote_server_status: Arc::new(Mutex::new(None)),
             remote_probe_in_flight: Arc::new(AtomicBool::new(false)),
-            remote_probe_verdict_pending: Arc::new(AtomicBool::new(false)),
             remote_busy_until: Arc::new(Mutex::new(None)),
         };
 
@@ -749,88 +743,40 @@ impl TranscriptionManager {
         if self.remote_probe_in_flight.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.remote_probe_verdict_pending
-            .store(true, Ordering::Release);
         let manager = self.clone();
         thread::spawn(move || {
             let settings = get_settings(&manager.app_handle);
             let can_fall_back =
                 settings.remote_transcription_fallback && !settings.selected_model.is_empty();
             let busy_timeout = remote_busy_timeout(&settings);
-            let url = settings.remote_transcription_url.clone();
             let state = match busy_timeout {
                 Some(_) if can_fall_back && manager.remote_busy_held() => {
                     debug!("Transcription server timed out recently; not probing it");
                     RemoteServerState::Busy
                 }
-                Some(timeout) if can_fall_back => {
-                    // The probe gets far longer than the busy timeout: a
-                    // server that unloaded its model while idle needs a few
-                    // seconds to load it again, and is then as fast as ever.
-                    let (tx, rx) = mpsc::channel();
-                    let probe_settings = settings.clone();
-                    let probe_started = Instant::now();
-                    thread::spawn(move || {
-                        let _ = tx.send(probe_remote_responsiveness(
-                            &probe_settings,
-                            REMOTE_PROBE_MAX_WAIT.max(timeout),
-                        ));
-                    });
-                    match rx.recv_timeout(timeout) {
-                        Ok(state) => state,
-                        Err(_) => {
-                            info!(
-                                "Transcription server at {} did not answer within {}ms; preloading local model '{}' while waiting for it",
-                                url,
-                                timeout.as_millis(),
-                                settings.selected_model
-                            );
-                            // Start the load before giving the verdict, so
-                            // transcribe() sees it running when it races it.
-                            manager.initiate_local_model_load(false);
-                            manager.set_remote_server_state(RemoteServerState::Busy);
-                            manager
-                                .remote_probe_verdict_pending
-                                .store(false, Ordering::Release);
-                            let late = rx.recv().unwrap_or(RemoteServerState::Busy);
-                            // A real request that timed out meanwhile knows better.
-                            if late == RemoteServerState::Online && !manager.remote_busy_held() {
-                                info!(
-                                    "Transcription server at {} answered the probe after {}ms",
-                                    url,
-                                    probe_started.elapsed().as_millis()
-                                );
-                                manager.set_remote_server_state(RemoteServerState::Online);
-                            } else {
-                                info!("Transcription server at {} is {:?}", url, late);
-                            }
-                            manager
-                                .remote_probe_in_flight
-                                .store(false, Ordering::Release);
-                            return;
-                        }
-                    }
+                Some(timeout) if can_fall_back => probe_remote_responsiveness(&settings, timeout),
+                _ if remote_server_reachable(&settings.remote_transcription_url) => {
+                    RemoteServerState::Online
                 }
-                _ if remote_server_reachable(&url) => RemoteServerState::Online,
                 _ => RemoteServerState::Offline,
             };
-            // Record the state before clearing the flags: transcribe() reads
-            // it as soon as they drop.
+            // Record the state before clearing the flag: transcribe() reads it
+            // as soon as the flag drops.
             manager.set_remote_server_state(state);
-            manager
-                .remote_probe_verdict_pending
-                .store(false, Ordering::Release);
             manager
                 .remote_probe_in_flight
                 .store(false, Ordering::Release);
 
+            let url = &settings.remote_transcription_url;
             match state {
                 RemoteServerState::Online => debug!("Transcription server is responsive"),
                 _ if !can_fall_back => info!("Transcription server at {} is {:?}", url, state),
                 RemoteServerState::Busy => {
                     info!(
-                        "Transcription server at {} is busy; preloading local model '{}'",
-                        url, settings.selected_model
+                        "Transcription server at {} did not answer within {}ms; preloading local model '{}'",
+                        url,
+                        settings.remote_transcription_busy_timeout_ms,
+                        settings.selected_model
                     );
                     manager.initiate_local_model_load(false);
                 }
@@ -910,32 +856,9 @@ impl TranscriptionManager {
     /// an answer; wait for it rather than sending to a server that may be busy.
     fn wait_for_remote_probe(&self, busy_timeout: Duration) {
         let deadline = Instant::now() + busy_timeout + REMOTE_PROBE_TIMEOUT + REMOTE_PROBE_SLACK;
-        while self.remote_probe_verdict_pending.load(Ordering::Acquire) && Instant::now() < deadline
-        {
+        while self.remote_probe_in_flight.load(Ordering::Acquire) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
-    }
-
-    /// The probe passed the busy timeout but is still waiting for the server,
-    /// and the local model is loading. Whichever is ready first takes the
-    /// recording: a server that was only loading its own model is often back
-    /// before a local model has loaded. Returns the server's state then.
-    fn race_remote_probe_against_local_load(&self) -> Option<RemoteServerState> {
-        let started = Instant::now();
-        while self.remote_probe_in_flight.load(Ordering::Acquire)
-            && *self.is_loading.lock().unwrap()
-            && started.elapsed() < REMOTE_PROBE_MAX_WAIT
-        {
-            thread::sleep(Duration::from_millis(20));
-        }
-        let state = self.recent_remote_server_state();
-        if state == Some(RemoteServerState::Online) {
-            info!(
-                "Transcription server answered after {}ms, before the local model was ready",
-                started.elapsed().as_millis()
-            );
-        }
-        state
     }
 
     /// Like [`Self::initiate_model_load`], but also while a remote server is
@@ -1260,16 +1183,11 @@ impl TranscriptionManager {
             }
             // The probe at recording start already found the server down or
             // busy: don't wait for it again, the local model is loading.
-            let mut known_state = if can_fall_back {
+            let known_state = if can_fall_back {
                 self.recent_remote_server_state()
             } else {
                 None
             };
-            if known_state == Some(RemoteServerState::Busy)
-                && self.remote_probe_in_flight.load(Ordering::Acquire)
-            {
-                known_state = self.race_remote_probe_against_local_load();
-            }
             let result = match known_state {
                 Some(RemoteServerState::Offline) => {
                     Err(anyhow::anyhow!("server unreachable at recording start"))
@@ -1749,10 +1667,6 @@ const REMOTE_TRANSCRIPTION_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Timeout of the reachability probe at recording start. A server on the
 /// local network or the same machine accepts a connection in milliseconds.
 const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
-/// How long a probe keeps waiting for a server that passed the busy timeout.
-/// Covers a server that unloaded its model while idle and loads it again on
-/// the next request; the local fallback is already loading meanwhile.
-const REMOTE_PROBE_MAX_WAIT: Duration = Duration::from_secs(30);
 /// How long a probe result counts as current. Recordings are rarely longer.
 const REMOTE_STATUS_MAX_AGE: Duration = Duration::from_secs(120);
 /// Extra time `transcribe()` gives a running probe beyond its own timeouts,
