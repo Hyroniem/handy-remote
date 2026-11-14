@@ -2,9 +2,21 @@ name: "Fork Build"
 
 # Unsigned installers for this fork: Linux .deb, Windows .exe and .msi, and
 # macOS .dmg (Apple Silicon and Intel, ad-hoc signed, not notarized).
-# Download them from the run's artifacts.
+#
+# Every run keeps them as run artifacts (30 days). A build of main whose
+# version (src-tauri/tauri.conf.json) has no release yet also publishes a
+# GitHub release v<version>-remote with the installers attached, so they stay
+# downloadable. To publish a fork fix on a version that already has a
+# release, run this workflow on main with "Publish a release" checked; that
+# creates v<version>-remote.2, .3, ...
 on:
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Publish a release, also if this version already has one (then as v<version>-remote.N)"
+        required: false
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -43,3 +55,109 @@ jobs:
       sign-binaries: false
       asset-prefix: "handy-fork"
       upload-artifacts: true
+
+  # Runs only when every platform built, so a release never misses one.
+  release:
+    needs: build
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.release)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: fork-release
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Pick the release tag
+        id: tag
+        env:
+          FORCE: ${{ inputs.release && 'true' || 'false' }}
+        run: |
+          version=$(jq -r .version src-tauri/tauri.conf.json)
+          base="v${version}-remote"
+          if ! gh release view "$base" >/dev/null 2>&1; then
+            tag="$base"
+            title="Handy Remote $version"
+          elif [ "$FORCE" = "true" ]; then
+            n=2
+            while gh release view "$base.$n" >/dev/null 2>&1; do n=$((n + 1)); done
+            tag="$base.$n"
+            title="Handy Remote $version (build $n)"
+          else
+            echo "Release $base already exists; run this workflow with \"Publish a release\" to add a newer one."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Publishing $tag"
+          {
+            echo "publish=true"
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "title=$title"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download the installers
+        if: steps.tag.outputs.publish == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: handy-fork-*
+          path: artifacts
+
+      - name: Collect and rename the installers
+        if: steps.tag.outputs.publish == 'true'
+        run: |
+          mkdir release-assets
+          # Handy_0.10.1_x64-setup.exe -> Handy-Remote_0.10.1_x64-setup.exe,
+          # so they can't be mistaken for upstream's (signed) installers.
+          find artifacts -type f \( -name '*.dmg' -o -name '*.deb' -o -name '*.msi' -o -name '*-setup.exe' \) -print0 |
+            while IFS= read -r -d '' file; do
+              name=$(basename "$file")
+              cp "$file" "release-assets/${name/#Handy_/Handy-Remote_}"
+            done
+          ls -l release-assets
+          for ext in dmg deb msi exe; do
+            if ! ls release-assets/*."$ext" >/dev/null 2>&1; then
+              echo "No .$ext installer found" >&2
+              exit 1
+            fi
+          done
+
+      - name: Publish the release
+        if: steps.tag.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          TITLE: ${{ steps.tag.outputs.title }}
+        run: |
+          cat > notes.md <<EOF
+          Handy with an optional external, OpenAI-compatible Whisper server: **Settings → Models → Transcription Server → Use external server**. Handy then sends recordings to that server instead of loading a model on the GPU, and can fall back to a local model when the server is busy or unreachable.
+
+          Based on [Handy v${VERSION}](https://github.com/cjpais/Handy/releases/tag/v${VERSION}); see there for what changed in Handy itself. Changes to the fork: [merged pull requests](https://github.com/${GH_REPO}/pulls?q=is%3Apr+is%3Amerged).
+
+          ## Downloads
+
+          | File | For |
+          | --- | --- |
+          | \`Handy-Remote_${VERSION}_x64-setup.exe\` or \`.msi\` | Windows |
+          | \`Handy-Remote_${VERSION}_aarch64.dmg\` | Mac with Apple Silicon (M1 and newer) |
+          | \`Handy-Remote_${VERSION}_x64.dmg\` | Mac with an Intel processor |
+          | \`Handy-Remote_${VERSION}_amd64.deb\` | Linux (Debian, Ubuntu) |
+
+          ## First launch
+
+          These builds are not signed, and Handy Remote does not update itself: download the next version from [Releases](https://github.com/${GH_REPO}/releases).
+
+          - **Windows**: SmartScreen warns on first launch. Choose _More info → Run anyway_.
+          - **macOS**: the app is not notarized, so macOS blocks the first launch. Drag Handy to Applications, try to open it, then choose _Open Anyway_ at the bottom of _System Settings → Privacy & Security_. Or run \`xattr -dr com.apple.quarantine /Applications/Handy.app\` in Terminal. After an update you may have to grant Accessibility and Microphone access again.
+
+          Installing replaces upstream Handy if you have it, since both use the same app ID and settings.
+          EOF
+          gh release create "$TAG" release-assets/* \
+            --target "$GITHUB_SHA" \
+            --title "$TITLE" \
+            --notes-file notes.md \
+            --latest

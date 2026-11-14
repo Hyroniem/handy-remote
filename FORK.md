@@ -7,12 +7,22 @@ model on the GPU itself.
 
 ## Downloading
 
-Every push to `main` builds through **Actions → Fork Build**:
+Download the installers from [Releases](https://github.com/Hyroniem/handy-remote/releases/latest):
 
-- `handy-fork-ubuntu-22.04-x86_64-unknown-linux-gnu`: `.deb` for Linux
-- `handy-fork-x86_64-pc-windows-msvc`: `.exe` installer and `.msi` for Windows
-- `handy-fork-aarch64-apple-darwin`: `.dmg` for Macs with Apple Silicon (M1 and newer)
-- `handy-fork-x86_64-apple-darwin`: `.dmg` for Macs with an Intel processor
+- `Handy-Remote_<version>_x64-setup.exe` or `.msi`: Windows
+- `Handy-Remote_<version>_aarch64.dmg`: Macs with Apple Silicon (M1 and newer)
+- `Handy-Remote_<version>_x64.dmg`: Macs with an Intel processor
+- `Handy-Remote_<version>_amd64.deb`: Linux
+
+Handy Remote does not update itself: download a new version from Releases.
+
+Every push to `main` builds through **Actions → Fork Build**, which keeps the
+installers as run artifacts for 30 days. When the version in
+`src-tauri/tauri.conf.json` has no release yet, as after merging a new upstream
+release, that build also publishes a release `v<version>-remote` with the
+installers attached. To publish a fork fix on a version that already has a
+release, run **Fork Build** on `main` with _Publish a release_ checked: that
+creates `v<version>-remote.2`, `.3`, and so on.
 
 The builds are not signed. Windows SmartScreen therefore warns on first launch:
 choose _More info → Run anyway_.
@@ -72,7 +82,7 @@ What the fork changes compared to upstream, for whoever resolves the conflicts:
 | `src-tauri/tauri.conf.json`                                                                                                     | `createUpdaterArtifacts: false`, Windows `signCommand` removed (no keys in the fork)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `src/components/settings/RemoteTranscription.tsx`, `models/ModelsSettings.tsx`, `settingsStore.ts`, `bindings.ts`, translations | settings UI (on the Models page, above the model table)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `src/i18n/locales/*/translation.json`                                                                                           | keys `settings.remoteTranscription.*`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `.github/workflows/`                                                                                                            | `fork-build.yml` added; `main-build.yml` and `nix-check.yml` manual only; `build.yml` has an extra step "Build with Tauri (unsigned macOS)" without Apple variables                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `.github/workflows/`                                                                                                            | `fork-build.yml` added (also publishes the releases); `main-build.yml` and `nix-check.yml` manual only; `build.yml` has an extra step "Build with Tauri (unsigned macOS)" without Apple variables                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 
 After a merge, check that `bun run format:check` and `cargo test` pass, or let the
 _test_ and _code quality_ workflows do it.
