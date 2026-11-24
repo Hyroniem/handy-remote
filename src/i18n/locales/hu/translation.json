@@ -898,6 +898,34 @@
           "details": "A Handy helyi beszédfelismerése a transcribe.cpp-re és a ggml-re épül. Köszönet Georgi Gerganov és a közreműködők csodálatos munkájáért."
         }
       }
+    },
+    "remoteTranscription": {
+      "title": "Transcription Server",
+      "localModelsFallback": "Handy uses the active model below when the server can't be reached.",
+      "localModelsUnused": "Not used while the external server is on. Turn on the fallback to use a local model when the server can't be reached.",
+      "enabled": {
+        "label": "Use External Server",
+        "description": "Send recordings to an OpenAI-compatible Whisper server instead of loading a local model. Saves GPU memory when that server already runs."
+      },
+      "url": {
+        "title": "Server URL",
+        "description": "Base URL of the API, including /v1. Handy posts to {URL}/audio/transcriptions."
+      },
+      "apiKey": {
+        "title": "API Key",
+        "description": "Optional. Sent as a Bearer token in the Authorization header. Leave empty for a server without authentication.",
+        "placeholder": "Optional"
+      },
+      "fallback": {
+        "label": "Fall Back to Local Model",
+        "description": "If the server can't be reached or returns an error, transcribe with the local model. Handy checks the server as soon as recording starts, so the local model can already load while you speak. Once the server answers again, the local model is unloaded."
+      },
+      "busyTimeout": {
+        "label": "Switch When Server Is Busy",
+        "description": "When the server accepts the connection but doesn't answer a short test request within this time, for example because it is still transcribing a long recording, Handy uses the local model. The same applies when a recording takes longer than this time plus its own length (at least 10 seconds); the server is then skipped for 30 seconds. Once the server answers quickly again, it switches back. Off only checks whether the server can be reached.",
+        "off": "Off",
+        "seconds": "{{seconds}} s"
+      }
     }
   },
   "footer": {
